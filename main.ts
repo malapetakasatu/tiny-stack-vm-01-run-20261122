@@ -1,171 +1,100 @@
-/**
- * Tiny Stack Virtual Machine (make.fun: tiny-stack-vm-01)
- *
- * Implements a high-performance interpreter for the 32-bit Tiny Stack ISA:
- * - 256-word data stack, 64-word call stack, 256-word memory
- * - 1,000,000 step execution limit, 65,536-byte output buffer
- * - Traps: 2=UNDERFLOW, 3=OVERFLOW, 4=DIV_ZERO, 5=BAD_OPCODE, 6=MEMORY,
- *          7=CALL_DEPTH, 8=RET_EMPTY, 9=PC, 10=STEPS, 11=OUTPUT
- */
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 
-import { readdirSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+const I = new Uint8Array(256);
+const T = [0,128,1,145,2,193,3,132,4,134,5,138,6,139,7,143,23,133,27,133,48,160,49,164,50,164,51,160,52,128,64,133,65,136,80,132,81,132,82,129,83,132];
+for (let i = 0; i < T.length;) I[T[i++]] = T[i++];
+for (let k = 16; k <= 34; k++) if (k !== 23 && k !== 27 && k !== 31) I[k] = 137;
 
-interface VMResult {
-  readonly stdout: Uint8Array;
-  readonly exitCode: number;
-}
+function runVM(code: Uint8Array, input: Uint8Array) {
+  const S = new Int32Array(256), C = new Int32Array(64), M = new Int32Array(256), O = new Uint8Array(65536);
+  let sp = 0, csp = 0, pc = 0, ip = 0, op = 0, steps = 0, exit = 0;
+  const n = code.length;
 
-function runVM(prog: Uint8Array, input: Uint8Array): VMResult {
-  const stack = new Int32Array(256), memory = new Int32Array(256), callStack = new Int32Array(64), output = new Uint8Array(65536);
-  let sp = 0, csp = 0, pc = 0, inPtr = 0, outLen = 0, steps = 0, exitCode = 0;
-  const pLen = prog.length;
-
-  vmLoop: while (true) {
-    if (steps >= 1000000) { exitCode = 10; break; }
-    if (pc < 0 || pc >= pLen) { exitCode = 9; break; }
-
-    const op = prog[pc];
-    switch (op) {
-      case 0x00: exitCode = 0; break vmLoop; // HALT
-      case 0x01: // PUSH8
-        if (pc + 2 > pLen) { exitCode = 9; break vmLoop; }
-        if (sp >= 256) { exitCode = 3; break vmLoop; }
-        stack[sp++] = (prog[pc + 1] << 24) >> 24;
-        pc += 2;
-        break;
-      case 0x02: // PUSH32
-        if (pc + 5 > pLen) { exitCode = 9; break vmLoop; }
-        if (sp >= 256) { exitCode = 3; break vmLoop; }
-        stack[sp++] = prog[pc + 1] | (prog[pc + 2] << 8) | (prog[pc + 3] << 16) | (prog[pc + 4] << 24);
-        pc += 5;
-        break;
-      case 0x03: // POP
-        if (sp < 1) { exitCode = 2; break vmLoop; }
-        sp--; pc++; break;
-      case 0x04: // DUP
-        if (sp < 1) { exitCode = 2; break vmLoop; }
-        if (sp >= 256) { exitCode = 3; break vmLoop; }
-        stack[sp] = stack[sp - 1]; sp++; pc++; break;
-      case 0x05: { // SWAP
-        if (sp < 2) { exitCode = 2; break vmLoop; }
-        const t = stack[sp - 1]; stack[sp - 1] = stack[sp - 2]; stack[sp - 2] = t;
-        pc++; break;
-      }
-      case 0x06: // OVER
-        if (sp < 2) { exitCode = 2; break vmLoop; }
-        if (sp >= 256) { exitCode = 3; break vmLoop; }
-        stack[sp] = stack[sp - 2]; sp++; pc++; break;
-      case 0x07: { // ROT
-        if (sp < 3) { exitCode = 2; break vmLoop; }
-        const c = stack[sp - 1], b = stack[sp - 2], a = stack[sp - 3];
-        stack[sp - 3] = b; stack[sp - 2] = c; stack[sp - 1] = a;
-        pc++; break;
-      }
-      case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15: case 0x16:
-      case 0x18: case 0x19: case 0x1a: case 0x1c: case 0x1d: case 0x1e:
-      case 0x20: case 0x21: case 0x22: {
-        if (sp < 2) { exitCode = 2; break vmLoop; }
-        const b = stack[--sp], a = stack[--sp];
-        if (b === 0 && (op === 0x13 || op === 0x14 || op === 0x15 || op === 0x16)) { exitCode = 4; break vmLoop; }
-        let res = 0;
-        if (op === 0x10) res = (a + b) | 0;
-        else if (op === 0x11) res = (a - b) | 0;
-        else if (op === 0x12) res = Math.imul(a, b);
-        else if (op === 0x13) res = (a === -2147483648 && b === -1) ? a : ((a / b) | 0);
-        else if (op === 0x14) res = b === -1 ? 0 : ((a % b) | 0);
-        else if (op === 0x15) res = Math.floor((a >>> 0) / (b >>> 0)) | 0;
-        else if (op === 0x16) res = ((a >>> 0) % (b >>> 0)) | 0;
-        else if (op === 0x18) res = a & b;
-        else if (op === 0x19) res = a | b;
-        else if (op === 0x1a) res = a ^ b;
-        else if (op === 0x1c) res = a << (b & 31);
-        else if (op === 0x1d) res = a >> (b & 31);
-        else if (op === 0x1e) res = (a >>> (b & 31)) | 0;
-        else if (op === 0x20) res = a === b ? 1 : 0;
-        else if (op === 0x21) res = a < b ? 1 : 0;
-        else if (op === 0x22) res = (a >>> 0) < (b >>> 0) ? 1 : 0;
-        stack[sp++] = res; pc++; break;
-      }
-      case 0x17: case 0x1b: // NEG, NOT
-        if (sp < 1) { exitCode = 2; break vmLoop; }
-        stack[sp - 1] = op === 0x17 ? (-stack[sp - 1]) | 0 : ~stack[sp - 1];
-        pc++; break;
-      case 0x30: case 0x31: case 0x32: { // JMP, JZ, JNZ
-        if (pc + 3 > pLen) { exitCode = 9; break vmLoop; }
-        const rel = ((prog[pc + 1] | (prog[pc + 2] << 8)) << 16) >> 16;
-        if (op === 0x30) { pc += 3 + rel; break; }
-        if (sp < 1) { exitCode = 2; break vmLoop; }
-        const v = stack[--sp];
-        pc = ((op === 0x31 && v === 0) || (op === 0x32 && v !== 0)) ? pc + 3 + rel : pc + 3;
-        break;
-      }
-      case 0x33: // CALL
-        if (pc + 3 > pLen) { exitCode = 9; break vmLoop; }
-        if (csp >= 64) { exitCode = 7; break vmLoop; }
-        callStack[csp++] = pc + 3;
-        pc = prog[pc + 1] | (prog[pc + 2] << 8);
-        break;
-      case 0x34: // RET
-        if (csp === 0) { exitCode = 8; break vmLoop; }
-        pc = callStack[--csp];
-        break;
-      case 0x40: { // LOAD
-        if (sp < 1) { exitCode = 2; break vmLoop; }
-        const addr = stack[--sp];
-        if (addr < 0 || addr >= 256) { exitCode = 6; break vmLoop; }
-        stack[sp++] = memory[addr];
-        pc++; break;
-      }
-      case 0x41: { // STORE
-        if (sp < 2) { exitCode = 2; break vmLoop; }
-        const addr = stack[--sp], val = stack[--sp];
-        if (addr < 0 || addr >= 256) { exitCode = 6; break vmLoop; }
-        memory[addr] = val;
-        pc++; break;
-      }
-      case 0x50: { // PRINT
-        if (sp < 1) { exitCode = 2; break vmLoop; }
-        const s = String(stack[--sp]);
-        if (outLen + s.length > 65536) { exitCode = 11; break vmLoop; }
-        for (let i = 0; i < s.length; i++) output[outLen++] = s.charCodeAt(i);
-        pc++; break;
-      }
-      case 0x51: // PUTC
-        if (sp < 1) { exitCode = 2; break vmLoop; }
-        if (outLen + 1 > 65536) { exitCode = 11; break vmLoop; }
-        output[outLen++] = stack[--sp] & 255;
-        pc++; break;
-      case 0x52: // IN
-        if (sp >= 256) { exitCode = 3; break vmLoop; }
-        stack[sp++] = inPtr < input.length ? input[inPtr++] : -1;
-        pc++; break;
-      case 0x53: // EXIT
-        if (sp < 1) { exitCode = 2; break vmLoop; }
-        exitCode = stack[--sp] & 255;
-        break vmLoop;
-      default: // BAD_OPCODE
-        exitCode = 5;
-        break vmLoop;
-    }
+  loop: while (true) {
+    if (steps >= 1e6) { exit = 10; break; }
+    if (pc < 0 || pc >= n) { exit = 9; break; }
+    const m = I[code[pc]];
+    if (!m) { exit = 5; break; }
+    const imm = (m >> 4) & 7, pops = (m >> 2) & 3, next = pc + 1 + imm;
+    if (pc + imm >= n) { exit = 9; break; }
     steps++;
+    if (sp < pops) { exit = 2; break; }
+    if (sp - pops + (m & 3) > 256) { exit = 3; break; }
+    const c = code[pc];
+    pc = next;
+
+    if (c >= 16 && c <= 34 && c !== 23 && c !== 27) {
+      const b = S[--sp], a = S[--sp], u = b >>> 0, v = a >>> 0, s = b & 31;
+      if (!b && c >= 19 && c <= 22) { exit = 4; break; }
+      S[sp++] = c === 16 ? a + b | 0 : c === 17 ? a - b | 0 : c === 18 ? Math.imul(a, b) :
+        c === 19 ? (a === -0x80000000 && b === -1 ? a : a / b | 0) :
+        c === 20 ? (b === -1 ? 0 : a % b | 0) :
+        c === 21 ? Math.floor(v / u) | 0 : c === 22 ? v % u | 0 :
+        c === 24 ? a & b : c === 25 ? a | b : c === 26 ? a ^ b :
+        c === 28 ? a << s : c === 29 ? a >> s : c === 30 ? a >>> s | 0 :
+        c === 32 ? +(a === b) : c === 33 ? +(a < b) : +(v < u);
+      continue;
+    }
+
+    switch (c) {
+      case 0: exit = 0; break loop;
+      case 1: S[sp++] = (code[next - 1] << 24) >> 24; break;
+      case 2: S[sp++] = code[next - 4] | (code[next - 3] << 8) | (code[next - 2] << 16) | (code[next - 1] << 24); break;
+      case 3: sp--; break;
+      case 4: S[sp] = S[sp - 1]; sp++; break;
+      case 5: [S[sp - 1], S[sp - 2]] = [S[sp - 2], S[sp - 1]]; break;
+      case 6: S[sp] = S[sp - 2]; sp++; break;
+      case 7: [S[sp - 3], S[sp - 2], S[sp - 1]] = [S[sp - 2], S[sp - 1], S[sp - 3]]; break;
+      case 23: S[sp - 1] = -S[sp - 1] | 0; break;
+      case 27: S[sp - 1] = ~S[sp - 1]; break;
+      case 48: case 49: case 50: {
+        const rel = ((code[next - 2] | (code[next - 1] << 8)) << 16) >> 16;
+        if (c === 48 || (c === 49 ? !S[--sp] : !!S[--sp])) pc = next + rel;
+        break;
+      }
+      case 51:
+        if (csp >= 64) { exit = 7; break loop; }
+        C[csp++] = next; pc = code[next - 2] | (code[next - 1] << 8); break;
+      case 52:
+        if (!csp) { exit = 8; break loop; }
+        pc = C[--csp]; break;
+      case 64: {
+        const a = S[sp - 1];
+        if (a >>> 8) { exit = 6; break loop; }
+        S[sp - 1] = M[a]; break;
+      }
+      case 65: {
+        const a = S[sp - 1], val = S[sp - 2];
+        if (a >>> 8) { exit = 6; break loop; }
+        sp -= 2; M[a] = val; break;
+      }
+      case 80: {
+        const s = String(S[--sp]);
+        if (op + s.length > 65536) { exit = 11; break loop; }
+        for (let i = 0; i < s.length;) O[op++] = s.charCodeAt(i++);
+        break;
+      }
+      case 81:
+        if (op >= 65536) { exit = 11; break loop; }
+        O[op++] = S[--sp] & 255; break;
+      case 82:
+        S[sp++] = ip < input.length ? input[ip++] : -1; break;
+      case 83:
+        exit = S[--sp] & 255; break loop;
+    }
   }
-  return { stdout: output.subarray(0, outLen), exitCode };
+  return { stdout: O.subarray(0, op), exitCode: exit };
 }
 
 function main(): void {
-  const inDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-  const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-
-  for (const id of readdirSync(inDir).sort()) {
-    const prog = readFileSync(join(inDir, id, 'program.bin'));
-    const input = readFileSync(join(inDir, id, 'input.bin'));
-    const { stdout, exitCode } = runVM(prog, input);
-
-    const targetDir = join(outDir, id);
-    mkdirSync(targetDir, { recursive: true });
-    writeFileSync(join(targetDir, 'stdout.bin'), stdout);
-    writeFileSync(join(targetDir, 'exit.txt'), `${exitCode}\n`);
+  const [I, O] = [process.env.MAKEFUN_INPUT_DIR ?? '/input', process.env.MAKEFUN_OUTPUT_DIR ?? '/output'];
+  for (const id of fs.readdirSync(I).sort()) {
+    const res = runVM(fs.readFileSync(path.join(I, id, 'program.bin')), fs.readFileSync(path.join(I, id, 'input.bin')));
+    const d = path.join(O, id);
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, 'stdout.bin'), res.stdout);
+    fs.writeFileSync(path.join(d, 'exit.txt'), `${res.exitCode}\n`);
   }
 }
 
